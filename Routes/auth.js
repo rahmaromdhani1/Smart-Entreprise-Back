@@ -4,20 +4,39 @@ import crypto from "crypto";
 import jwt from "jsonwebtoken";
 import User from "../models/User.js";
 import dotenv from "dotenv";
+import { authenticateToken, authorizeRole } from "../middleware/auth.js";
 import { sendResetPasswordEmail } from "../services/mailservice.js";
 
 dotenv.config();
 const router = express.Router();
 
+router.get(
+  "/admin/dashboard",
+  authenticateToken,
+  authorizeRole("Admin"),
+  (req, res) => {
+    res.json({ message: "Welcome Admin" });
+  }
+);
+
+router.get(
+  "/staff/dashboard",
+  authenticateToken,
+  authorizeRole("Staff"),
+  (req, res) => {
+    res.json({ message: "Welcome Staff" });
+  }
+);
+
 // ========== LOGIN ==========
 router.post("/login", async (req, res) => {
   try {
-    const { mail, password } = req.body;
+    const { mail, password, selectedRole } = req.body;
 
-    if (!mail || !password) {
+    if (!mail || !password || !selectedRole) {
       return res.status(400).json({
         success: false,
-        message: "Email and password required",
+        message: "Email, password and role required",
       });
     }
 
@@ -26,6 +45,14 @@ router.post("/login", async (req, res) => {
       return res.status(404).json({
         success: false,
         message: "User not found",
+      });
+    }
+
+    // 🔥 Vérification du rôle
+    if (user.role.toLowerCase() !== selectedRole.toLowerCase()) {
+      return res.status(403).json({
+        success: false,
+        message: "Invalid role selected for this account",
       });
     }
 
@@ -43,18 +70,18 @@ router.post("/login", async (req, res) => {
       { expiresIn: "1d" }
     );
 
-  res.json({
-  success: true,
-  id: user._id,
-  firstName: user.firstName,
-  lastName: user.lastName,
-  phone: user.phone,
-  mail: user.mail,
-  role: user.role,
-  avatarColor: user.avatarColor || "#8B5CF6",
-  avatarImage: user.avatarImage || null,
-  token,
-});
+    res.json({
+      success: true,
+      id: user._id,
+      firstName: user.firstName,
+      lastName: user.lastName,
+      phone: user.phone,
+      mail: user.mail,
+      role: user.role,
+      avatarColor: user.avatarColor || "#8B5CF6",
+      avatarImage: user.avatarImage || null,
+      token,
+    });
 
   } catch (err) {
     console.error("login error:", err);
@@ -64,6 +91,7 @@ router.post("/login", async (req, res) => {
     });
   }
 });
+
 
 // In routes/auth.js - FORGOT PASSWORD route
 
@@ -108,9 +136,11 @@ router.post("/forgot-password", async (req, res) => {
     user.resetPasswordExpires = Date.now() + 15 * 60 * 1000;
 
     await user.save();
-
+    const clientUrl = req.body.platform === "mobile"
+  ? process.env.CLIENT_URL_MOBILE
+  : process.env.CLIENT_URL_WEB;
     // ✅ CHANGED: Use query parameter instead of path parameter
-    const resetLink = `${process.env.CLIENT_URL}/reset-password?token=${resetToken}`;
+    const resetLink = `${clientUrl}/reset-password?token=${resetToken}`;
     
     console.log('📧 Reset link generated:', resetLink);
 

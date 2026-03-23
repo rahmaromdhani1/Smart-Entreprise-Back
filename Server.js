@@ -14,7 +14,8 @@ import { fileURLToPath } from "url";
 import alertRoutes from "./Routes/alerte.route.js";
 import reportsRoutes from "./Routes/reports.js";
 import adminUsersRoutes from "./Routes/Adminusers.js";
-
+import seuilRoutes from "./Routes/Seuil.route.js"; 
+import EquipmentRoutes from "./Routes/Equipment.route.js";
 dotenv.config();
 console.log("MONGO_URI:", process.env.MONGO_URI); 
 
@@ -34,6 +35,8 @@ app.use(express.json());
 app.use(bodyParser.urlencoded({ limit: "10mb", extended: true }));
 app.use("/uploads", express.static(path.join(path.resolve(), "uploads"))); 
 app.use("/api/auth", authRoutes);
+app.use("/api/seuils", seuilRoutes); 
+app.use("/api/equipment", EquipmentRoutes); 
 app.use("/api/user", userRoutes); 
 app.use("/api/alerts", alertRoutes);
 app.use('/api', reportsRoutes);
@@ -96,8 +99,12 @@ setInterval(() => {
 mongoose.connect(process.env.MONGO_URI)
   .then(() => {
     console.log("MongoDB connected ✅");
+
     const PORT = process.env.PORT || 5000;
-    server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
+    server.listen(PORT, "0.0.0.0", () => {
+      console.log(`Server running on port ${PORT}`);
+    });
+
   })
   .catch(err => console.log(err));
- 
