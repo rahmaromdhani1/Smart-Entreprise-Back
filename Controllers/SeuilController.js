@@ -1,12 +1,27 @@
+//Controllers/seuilController.js
 import mongoose from "mongoose";
 import Seuil from "../models/Seuil.js";
 import Equipment from "../models/Equipment.js";
 import { requestThresholdProfileFromBackM } from "../services/AiService.js";
+import { pushAfterSeuilSave } from "../hooks/confighPushHook.js";
 
 /**
  * Small helpers for consistent logs/responses
  */
 const CTRL = "[SeuilController]";
+const THRESHOLD_SENSOR_TYPES = new Set([
+  "temperature",
+  "light",
+  "humidity",
+  "pressure",
+  "smoke",
+  "motion",
+]);
+
+const getThresholdSensors = (sensors = []) =>
+  (Array.isArray(sensors) ? sensors : []).filter((sensor) =>
+    THRESHOLD_SENSOR_TYPES.has(sensor)
+  );
 
 const logInfo = (message, extra = null) => {
   if (extra) console.log(`${CTRL} ${message}`, extra);
@@ -34,13 +49,54 @@ const sendError = (res, status, message, extra = {}) => {
 const isValidObjectId = (value) => mongoose.Types.ObjectId.isValid(value);
 
 /**
+ * Convert a plain object OR an existing Map to a proper ES6 Map so that
+ * Mongoose's Map field type receives the correct type and the pre('validate')
+ * hook can safely call .entries() on it.
+ *
+ * req.body is always a plain object after JSON.parse — assigning it directly
+ * to a Mongoose Map field does NOT auto-convert, causing `.entries()` to throw
+ * "next is not a function" inside the pre('validate') hook.
+ */
+const toMongooseMap = (value) => {
+  if (!value) return new Map();
+  if (value instanceof Map) return value;
+  return new Map(Object.entries(value));
+};
+
+/**
+ * Safe fire-and-forget wrapper for pushAfterSeuilSave.
+ * Prevents any internal crash (e.g. "next is not a function") from
+ * bubbling up and killing the HTTP response that has already been sent.
+ */
+const safePush = (equipmentId) => {
+  try {
+    const result = pushAfterSeuilSave(equipmentId);
+    // Handle promise rejections too (if the hook is async)
+    if (result && typeof result.catch === "function") {
+      result.catch((err) =>
+        logWarn("pushAfterSeuilSave async error (non-fatal)", {
+          equipmentId,
+          message: err.message,
+        })
+      );
+    }
+  } catch (err) {
+    logWarn("pushAfterSeuilSave sync error (non-fatal)", {
+      equipmentId,
+      message: err.message,
+    });
+  }
+};
+
+/**
  * Normalize payload for manual update
  * Keeps only fields that are allowed to be manually updated.
  */
 const buildManualUpdatePayload = (body = {}) => {
   const payload = {};
 
-  if (body.location !== undefined) payload.location = body.location;
+  if (body.floor !== undefined) payload.floor = body.floor;
+  if (body.officeRoom !== undefined) payload.officeRoom = body.officeRoom;
   if (body.thresholds !== undefined) payload.thresholds = body.thresholds;
 
   if (body.meta && typeof body.meta === "object") {
@@ -61,7 +117,6 @@ export const getAllSeuilProfiles = async (req, res) => {
     const {
       equipmentId,
       nodeId,
-      location,
       provider,
       usedSensorData,
       weatherAvailable,
@@ -87,10 +142,6 @@ export const getAllSeuilProfiles = async (req, res) => {
       filter.nodeId = String(nodeId).trim().toUpperCase();
     }
 
-    if (location) {
-      filter.location = new RegExp(String(location).trim(), "i");
-    }
-
     if (provider) {
       filter["meta.provider"] = String(provider).trim();
     }
@@ -111,7 +162,7 @@ export const getAllSeuilProfiles = async (req, res) => {
     const safeLimit = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 100);
 
     const sortDirection = String(order).toLowerCase() === "asc" ? 1 : -1;
-    const allowedSortFields = ["createdAt", "updatedAt", "nodeId", "location"];
+    const allowedSortFields = ["createdAt", "updatedAt", "nodeId"];
     const safeSortBy = allowedSortFields.includes(sortBy) ? sortBy : "createdAt";
 
     const skip = (safePage - 1) * safeLimit;
@@ -202,7 +253,7 @@ export const getSeuilProfileByEquipmentId = async (req, res) => {
 
 /**
  * POST /api/seuils/equipment/:equipmentId/regenerate
- * Re-generate threshold profile using BackM AI flow
+ * Re-generate threshold profile using BackM AI flow.
  */
 export const regenerateSeuilProfile = async (req, res) => {
   const startedAt = Date.now();
@@ -225,15 +276,25 @@ export const regenerateSeuilProfile = async (req, res) => {
     logInfo("Equipment found for regeneration", {
       equipmentId,
       nodeId: equipment.nodeId,
-      location: equipment.location,
+      floor: equipment.floor,
+      officeRoom: equipment.officeRoom,
       sensors: equipment.sensors,
     });
 
-    if (!Array.isArray(equipment.sensors) || equipment.sensors.length === 0) {
-      return sendError(res, 422, "Equipment has no sensors configured");
+    const thresholdSensors = getThresholdSensors(equipment.sensors);
+
+    if (thresholdSensors.length === 0) {
+      return res.status(200).json({
+        success: true,
+        message: "Equipment has no sensors that require thresholds",
+        data: null,
+      });
     }
 
-    const generatedProfile = await requestThresholdProfileFromBackM(equipment);
+    const generatedProfile = await requestThresholdProfileFromBackM({
+      ...equipment,
+      sensors: thresholdSensors,
+    });
 
     logInfo("Generated profile received from BackM", {
       equipmentId,
@@ -244,19 +305,45 @@ export const regenerateSeuilProfile = async (req, res) => {
       meta: generatedProfile?.meta,
     });
 
+    const existingSeuil = await Seuil.findOne({ equipmentId: equipment._id }).lean();
+
+    const rawThresholds = existingSeuil?.thresholds;
+    const existingThresholds = !rawThresholds
+      ? {}
+      : rawThresholds instanceof Map
+      ? Object.fromEntries(rawThresholds)
+      : rawThresholds;
+
+    const finalThresholds = Object.fromEntries(
+      Object.entries(generatedProfile.thresholds || {}).filter(([sensorType]) =>
+        thresholdSensors.includes(sensorType)
+      )
+    );
+
+    for (const [sensorType, existingThreshold] of Object.entries(existingThresholds)) {
+      if (
+        existingThreshold?.mode === "user" &&
+        finalThresholds[sensorType] !== undefined
+      ) {
+        finalThresholds[sensorType] = existingThreshold;
+        logInfo(`Skipping sensor ${sensorType} — user-defined, AI cannot override`);
+      }
+    }
+
     const seuilPayload = {
       equipmentId: equipment._id,
       nodeId: generatedProfile.nodeId || equipment.nodeId,
-      location: generatedProfile.location ?? equipment.location ?? "",
-      thresholds: generatedProfile.thresholds,
+      floor: generatedProfile.floor ?? equipment.floor ?? "",
+      officeRoom: generatedProfile.officeRoom ?? equipment.officeRoom ?? "",
+      thresholds: finalThresholds,
       meta: generatedProfile.meta || {},
     };
 
     logInfo("Saving regenerated seuil payload", seuilPayload);
 
     const seuil = await Seuil.findOneAndUpdate(
-      { equipmentId: equipment._id },
-      seuilPayload,
+      { nodeId: seuilPayload.nodeId },
+      { $set: seuilPayload },
       {
         new: true,
         upsert: true,
@@ -271,6 +358,9 @@ export const regenerateSeuilProfile = async (req, res) => {
       nodeId: seuil.nodeId,
       durationMs: Date.now() - startedAt,
     });
+
+    // ✅ Fire-and-forget — crash inside hook won't affect the response
+    safePush(equipment._id);
 
     return res.status(200).json({
       success: true,
@@ -342,12 +432,19 @@ export const updateSeuilProfile = async (req, res) => {
       return sendError(res, 400, "No valid fields provided for update");
     }
 
-    if (payload.location !== undefined) {
-      existing.location = payload.location;
+    if (payload.floor !== undefined) {
+      existing.floor = payload.floor;
+    }
+
+    if (payload.officeRoom !== undefined) {
+      existing.officeRoom = payload.officeRoom;
     }
 
     if (payload.thresholds !== undefined) {
-      existing.thresholds = payload.thresholds;
+      // payload.thresholds comes from req.body — always a plain object.
+      // Mongoose Map fields require a real Map; assigning a plain object
+      // skips the conversion and breaks .entries() in the pre('validate') hook.
+      existing.thresholds = toMongooseMap(payload.thresholds);
     }
 
     if (payload.meta !== undefined) {
@@ -364,6 +461,9 @@ export const updateSeuilProfile = async (req, res) => {
       nodeId: existing.nodeId,
       durationMs: Date.now() - startedAt,
     });
+
+    // ✅ Fire-and-forget — crash inside hook won't affect the response
+    safePush(equipmentId);
 
     return res.status(200).json({
       success: true,
@@ -384,6 +484,181 @@ export const updateSeuilProfile = async (req, res) => {
     }
 
     return sendError(res, 500, "Failed to update seuil profile", {
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * PUT /api/seuils/sensor/:sensorType/global
+ * Manually set the same threshold values for a given sensor type across ALL
+ * equipment profiles that have it.
+ */
+export const globalUpdateSensorThreshold = async (req, res) => {
+  const { sensorType } = req.params;
+  const {
+    min,
+    max,
+    threshold,
+    hysteresis = 0,
+    reason = "",
+    description = "",
+  } = req.body;
+
+  try {
+    logInfo("globalUpdateSensorThreshold called", { sensorType, body: req.body });
+
+    const profiles = await Seuil.find({
+      [`thresholds.${sensorType}`]: { $exists: true },
+    }).lean();
+
+    if (profiles.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: `No equipment profiles found with sensor: ${sensorType}`,
+      });
+    }
+
+    const newThreshold = {
+      min:         Number(min),
+      max:         Number(max),
+      threshold:   Number(threshold),
+      hysteresis:  Number(hysteresis),
+      reason:      reason || "",
+      description: description || "",
+      mode:        "user",
+      confidence:  1,
+    };
+
+    const result = await Seuil.updateMany(
+      {
+        [`thresholds.${sensorType}`]: { $exists: true },
+        [`thresholds.${sensorType}.mode`]: { $ne: "locked" },
+      },
+      {
+        $set: { [`thresholds.${sensorType}`]: newThreshold },
+      }
+    );
+
+    const updatedCount = result.modifiedCount;
+    logInfo("globalUpdateSensorThreshold success", { sensorType, updatedCount });
+
+    if (updatedCount > 0) {
+      // ✅ Fire-and-forget for each profile
+      profiles.forEach((profile) => safePush(profile.equipmentId));
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: `Sensor "${sensorType}" updated in ${updatedCount} profile(s). Mode set to "user".`,
+      data: { sensorType, updatedCount },
+    });
+  } catch (error) {
+    logError("globalUpdateSensorThreshold failed", { message: error.message });
+    return sendError(res, 500, "Failed to globally update sensor threshold", {
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * POST /api/seuils/sensor/:sensorType/regenerate-all
+ * Ask the AI to regenerate a given sensor type across ALL equipment that have it.
+ */
+export const globalRegenerateSensorThreshold = async (req, res) => {
+  const { sensorType } = req.params;
+
+  try {
+    logInfo("globalRegenerateSensorThreshold called", { sensorType });
+    const equipmentsWithSensor = await Equipment.find({
+      sensors: sensorType,
+    }).lean();
+
+    if (equipmentsWithSensor.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: `No equipment found with sensor: ${sensorType}`,
+      });
+    }
+
+    let updatedCount = 0;
+    let skippedCount = 0;
+    const errors = [];
+
+    for (const equipment of equipmentsWithSensor) {
+      try {
+        const existingSeuil = await Seuil.findOne({
+          equipmentId: equipment._id,
+        }).lean();
+
+        const existingMode = existingSeuil?.thresholds?.[sensorType]?.mode;
+
+        if (existingMode === "user") {
+          logInfo(
+            `Skipping ${equipment.nodeId} — sensor ${sensorType} is user-defined`
+          );
+          skippedCount++;
+          continue;
+        }
+
+        const equipmentForAI = { ...equipment, sensors: [sensorType] };
+        const generatedProfile =
+          await requestThresholdProfileFromBackM(equipmentForAI);
+
+        const existingThresholds = existingSeuil?.thresholds
+          ? Object.fromEntries(Object.entries(existingSeuil.thresholds))
+          : {};
+
+        const mergedThresholds = {
+          ...existingThresholds,
+          [sensorType]: generatedProfile.thresholds[sensorType],
+        };
+
+        await Seuil.findOneAndUpdate(
+          { nodeId: equipment.nodeId },
+          {
+            $set: {
+              equipmentId: equipment._id,
+              nodeId: equipment.nodeId,
+              floor: equipment.floor || "",
+              officeRoom: equipment.officeRoom || "",
+              thresholds: mergedThresholds,
+              meta: generatedProfile.meta || {},
+            },
+          },
+          {
+            new: true,
+            upsert: true,
+            runValidators: true,
+            setDefaultsOnInsert: true,
+          }
+        );
+
+        updatedCount++;
+      } catch (err) {
+        logError(
+          `Failed to regenerate ${sensorType} for ${equipment.nodeId}`,
+          { message: err.message }
+        );
+        errors.push({ nodeId: equipment.nodeId, error: err.message });
+      }
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: `Global AI regeneration complete for sensor "${sensorType}".`,
+      data: {
+        sensorType,
+        updatedCount,
+        skippedCount,
+        errors: errors.length > 0 ? errors : undefined,
+      },
+    });
+  } catch (error) {
+    logError("globalRegenerateSensorThreshold failed", {
+      message: error.message,
+    });
+    return sendError(res, 500, "Failed to globally regenerate sensor threshold", {
       error: error.message,
     });
   }

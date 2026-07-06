@@ -2,20 +2,14 @@
 import mongoose from 'mongoose';
 
 const VALID_ICONS = [
-  // Device icons
-  'lighting', 'hvac', 'cameras', 'access', 'fire', 'water',
-  // Sensor / type icons
-  'temperature', 'light', 'humidity', 'pressure', 'co2', 'motion',
+  'lighting', 'hvac', 'cameras', 'access', 'fire', 'water', 'energy',
+  'temperature', 'light', 'humidity', 'pressure', 'smoke', 'motion',
 ];
 
 const VALID_SENSOR_TYPES = [
-  'temperature', 'light', 'humidity', 'pressure', 'co2', 'motion',
+  'temperature', 'light', 'humidity', 'pressure', 'smoke', 'motion', 'energy',
 ];
 
-/**
- * Equipment Model
- * Fields: name, nodeId, ipAddress, location, description, status, icon, sensors, lastSeen
- */
 const equipmentSchema = new mongoose.Schema(
   {
     name: {
@@ -32,21 +26,33 @@ const equipmentSchema = new mongoose.Schema(
       uppercase: true,
       maxlength: [50, 'Node ID cannot exceed 50 characters'],
     },
+    mac: {
+      type: String,
+      default: "",
+      trim: true,
+      uppercase: true,
+      index: true,
+    },
     ipAddress: {
       type: String,
-      required: [true, 'IP Address is required'],
       trim: true,
       validate: {
         validator: (v) =>
+          !v ||
           /^(25[0-5]|2[0-4]\d|[01]?\d\d?)\.(25[0-5]|2[0-4]\d|[01]?\d\d?)\.(25[0-5]|2[0-4]\d|[01]?\d\d?)\.(25[0-5]|2[0-4]\d|[01]?\d\d?)$/.test(v),
-        message: (props) =>
-          `${props.value} is not a valid IPv4 address (format: xxx.xxx.xxx.xxx, 0–255)`,
+        message: (props) => `${props.value} is not a valid IPv4 address`,
       },
     },
-    location: {
+    floor: {
       type: String,
       trim: true,
-      maxlength: [150, 'Location cannot exceed 150 characters'],
+      maxlength: [100, 'Floor cannot exceed 100 characters'],
+      default: '',
+    },
+    officeRoom: {
+      type: String,
+      trim: true,
+      maxlength: [100, 'Office room cannot exceed 100 characters'],
       default: '',
     },
     description: {
@@ -58,13 +64,20 @@ const equipmentSchema = new mongoose.Schema(
     status: {
       type: String,
       enum: {
-        values: ['online', 'offline'],
-        message: 'Status must be "online" or "offline"',
+        values: ['online', 'offline', 'unknown'],
+        message: 'Status must be "online", "offline", or "unknown"',
       },
-      default: 'offline',
+      default: 'unknown',
     },
-
-    // ── Device icon (chosen in Add/Edit modal IconPicker) ──────────────────
+    isOnline: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+    lastHeartbeat: {
+      type: Date,
+      default: null,
+    },
     icon: {
       type: String,
       enum: {
@@ -73,32 +86,107 @@ const equipmentSchema = new mongoose.Schema(
       },
       default: 'lighting',
     },
-
-    // ── Attached sensors — flat array of type strings e.g. ['temperature', 'humidity'] ──
     sensors: {
-      type: [{ type: String, enum: { values: VALID_SENSOR_TYPES, message: `Sensor type must be one of: ${VALID_SENSOR_TYPES.join(', ')}` } }],
+      type: [
+        {
+          type: String,
+          enum: {
+            values: VALID_SENSOR_TYPES,
+            message: `Sensor type must be one of: ${VALID_SENSOR_TYPES.join(', ')}`,
+          },
+        },
+      ],
       default: [],
     },
-
+    actuators: {
+      type: [
+        {
+          sensorType: {
+            type: String,
+            required: [true, 'Actuator sensorType is required'],
+          },
+          type: {
+            type: String,
+            required: [true, 'Actuator type is required'],
+          },
+          controlType: {
+            type: String,
+            enum: ['toggle', 'slider', 'tone', 'led', 'blind'],
+            required: [true, 'Actuator controlType is required'],
+          },
+          min:       { type: Number, default: 0   },
+          max:       { type: Number, default: 255 },
+          default:   { type: Number, default: 0   },
+          frequency: { type: Number, default: 1000 },
+          // Dernière valeur connue (brightness 0-255 pour LED)
+          lastValue:  { type: mongoose.Schema.Types.Mixed, default: null },
+          lastUpdate: { type: Date,   default: null },
+          // ── NOUVEAU : dernière source de contrôle (LED uniquement) ─────────
+          // Persisté à chaque mise à jour via _cacheActuatorState.
+          // Permet de restaurer l'indicateur de contrôle au rechargement de page.
+          // Valeurs : 'app' | 'switch' | 'system' | 'automation' | null
+          lastSource: { type: String, default: null },
+        },
+      ],
+      default: [],
+    },
     lastSeen: {
       type: Date,
       default: null,
     },
   },
   {
-    timestamps: true,   // adds createdAt / updatedAt
+    timestamps: true,
     versionKey: false,
   }
 );
 
 equipmentSchema.index({ status: 1 });
+equipmentSchema.index({ isOnline: 1 });
+equipmentSchema.index({ mac: 1 });
+equipmentSchema.index({ floor: 1, officeRoom: 1 });
 
-// Virtual: human-readable lastSeen for the frontend list card
 equipmentSchema.virtual('lastSeenFormatted').get(function () {
   return this.lastSeen ? this.lastSeen.toLocaleString() : null;
 });
 
 equipmentSchema.set('toJSON', { virtuals: true });
+
+equipmentSchema.methods.setOnline = async function (online = true) {
+  this.isOnline = online;
+  this.status   = online ? 'online' : 'offline';
+  if (online) this.lastHeartbeat = new Date();
+  this.updatedAt = new Date();
+  return this.save();
+};
+
+equipmentSchema.methods.updateActuator = async function (actuatorType, value, source = null) {
+  const actuator = this.actuators.find((a) => a.type === actuatorType);
+  if (actuator) {
+    actuator.lastValue  = value;
+    actuator.lastUpdate = new Date();
+    if (source !== null) actuator.lastSource = source;
+    this.updatedAt = new Date();
+    return this.save();
+  }
+  return null;
+};
+
+equipmentSchema.methods.updateSensor = async function (sensorType, value) {
+  this.updatedAt = new Date();
+  return this.save();
+};
+
+equipmentSchema.methods.getActuator = function (actuatorType) {
+  return this.actuators.find((a) => a.type === actuatorType) || null;
+};
+
+equipmentSchema.methods.hasActuator = function (actuatorType) {
+  return this.actuators.some((a) => a.type === actuatorType);
+};
+
+equipmentSchema.statics.findByMac    = function (mac)    { return this.findOne({ mac:    mac.toUpperCase()    }); };
+equipmentSchema.statics.findByNodeId = function (nodeId) { return this.findOne({ nodeId: nodeId.toUpperCase() }); };
 
 const Equipment = mongoose.model('Equipment', equipmentSchema);
 

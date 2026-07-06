@@ -48,7 +48,6 @@ router.post("/login", async (req, res) => {
       });
     }
 
-    // 🔥 Vérification du rôle
     if (user.role.toLowerCase() !== selectedRole.toLowerCase()) {
       return res.status(403).json({
         success: false,
@@ -63,9 +62,19 @@ router.post("/login", async (req, res) => {
         message: "Incorrect password",
       });
     }
+    user.lastSeen = new Date();
+    user.isOnline = true;
+    await user.save();
 
     const token = jwt.sign(
-      { id: user._id, role: user.role },
+      {
+        id:               user._id,
+        role:             user.role,
+        functionalGrade:  user.functionalGrade,   // ← AJOUT
+        officeRoom:       user.officeRoom,          // ← AJOUT
+        floor:            user.floor,               // ← AJOUT
+        additionalAccess: user.additionalAccess,    // ← AJOUT
+      },
       process.env.JWT_SECRET,
       { expiresIn: "1d" }
     );
@@ -80,6 +89,12 @@ router.post("/login", async (req, res) => {
       role: user.role,
       avatarColor: user.avatarColor || "#8B5CF6",
       avatarImage: user.avatarImage || null,
+      functionalGrade: user.functionalGrade,
+      floor: user.floor,
+      officeRoom: user.officeRoom,
+      additionalAccess: user.additionalAccess,
+      isOnline: user.isOnline,
+      lastSeen: user.lastSeen,
       token,
     });
 
@@ -93,58 +108,36 @@ router.post("/login", async (req, res) => {
 });
 
 
-// In routes/auth.js - FORGOT PASSWORD route
-
 router.post("/forgot-password", async (req, res) => {
   try {
     const { mail } = req.body;
 
     if (!mail) {
-      return res.status(400).json({
-        success: false,
-        message: "Email required",
-      });
+      return res.status(400).json({ success: false, message: "Email required" });
     }
 
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     if (!emailRegex.test(mail)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid email format",
-      });
+      return res.status(400).json({ success: false, message: "Invalid email format" });
     }
 
     const user = await User.findOne({ mail: mail.toLowerCase() });
 
     if (!user) {
-      return res.json({
-        success: true,
-        message: "If this account exists, a reset email has been sent.",
-      });
+      return res.json({ success: true, message: "If this account exists, a reset email has been sent." });
     }
 
-    // Generate random token
     const resetToken = crypto.randomBytes(32).toString("hex");
-
-    // Hash the token
-    user.resetPasswordToken = crypto
-      .createHash("sha256")
-      .update(resetToken)
-      .digest("hex");
-
-    // Token valid for 15 minutes
+    user.resetPasswordToken = crypto.createHash("sha256").update(resetToken).digest("hex");
     user.resetPasswordExpires = Date.now() + 15 * 60 * 1000;
-
     await user.save();
+
     const clientUrl = req.body.platform === "mobile"
-  ? process.env.CLIENT_URL_MOBILE
-  : process.env.CLIENT_URL_WEB;
-    // ✅ CHANGED: Use query parameter instead of path parameter
+      ? process.env.CLIENT_URL_MOBILE
+      : process.env.CLIENT_URL_WEB;
     const resetLink = `${clientUrl}/reset-password?token=${resetToken}`;
-    
     console.log('📧 Reset link generated:', resetLink);
 
-    // Send email
     try {
       await sendResetPasswordEmail(user.mail, resetLink);
       console.log('✅ Reset email sent to:', user.mail);
@@ -152,144 +145,97 @@ router.post("/forgot-password", async (req, res) => {
       console.error("❌ Email sending error:", emailError);
     }
 
-    res.json({
-      success: true,
-      message: "If this account exists, a reset email has been sent.",
-    });
+    res.json({ success: true, message: "If this account exists, a reset email has been sent." });
   } catch (err) {
     console.error("❌ Erreur forgot-password:", err);
-    res.status(500).json({
-      success: false,
-      message: "Server error",
-    });
+    res.status(500).json({ success: false, message: "Server error" });
   }
 });
 
-// ========== VERIFY RESET TOKEN (CRUCIAL POUR MOBILE!) ==========
 router.post("/verify-reset-token", async (req, res) => {
   try {
-    const { token } = req.body; // ✅ Changed from req.params to req.body
+    const { token } = req.body;
 
     if (!token) {
-      return res.status(400).json({
-        valid: false, // ✅ Changed from success to valid
-        message: "Token required",
-      });
+      return res.status(400).json({ valid: false, message: "Token required" });
     }
 
-    console.log('🔍 Backend: Verifying token:', token);
-
-    // ✅ Hash the token to match database
-    const hashedToken = crypto
-      .createHash("sha256")
-      .update(token)
-      .digest("hex");
-
-    console.log('🔑 Backend: Hashed token:', hashedToken);
-
+    const hashedToken = crypto.createHash("sha256").update(token).digest("hex");
     const user = await User.findOne({
       resetPasswordToken: hashedToken,
       resetPasswordExpires: { $gt: Date.now() },
     });
 
     if (!user) {
-      console.log('❌ Backend: Token not found or expired');
-      return res.status(400).json({
-        valid: false, // ✅ Changed from success to valid
-        message: "Invalid or expired token",
-      });
+      return res.status(400).json({ valid: false, message: "Invalid or expired token" });
     }
 
-    console.log('✅ Backend: Token is valid for user:', user.mail);
-
-    res.json({
-      valid: true, // ✅ Changed from success to valid
-      message: "Valid token",
-      email: user.mail,
-    });
+    res.json({ valid: true, message: "Valid token", email: user.mail });
   } catch (err) {
     console.error("❌ Backend error verify-reset-token:", err);
-    res.status(500).json({
-      valid: false,
-      message: "Server error",
-    });
+    res.status(500).json({ valid: false, message: "Server error" });
   }
 });
 
-// ========== RESET PASSWORD (UPDATE TO SUPPORT BODY TOKEN) ==========
 router.post("/reset-password", async (req, res) => {
   try {
-    const { token, newPassword, confirmPassword } = req.body; // ✅ Get token from body
+    const { token, newPassword, confirmPassword } = req.body;
 
-    // Validations
-    if (!token) {
-      return res.status(400).json({
-        success: false,
-        message: "Token required",
-      });
-    }
+    if (!token)
+      return res.status(400).json({ success: false, message: "Token required" });
+    if (!newPassword || !confirmPassword)
+      return res.status(400).json({ success: false, message: "Both passwords are required" });
+    if (newPassword !== confirmPassword)
+      return res.status(400).json({ success: false, message: "The passwords do not match" });
+    if (newPassword.length < 8)
+      return res.status(400).json({ success: false, message: "Minimum 8 characters required" });
 
-    if (!newPassword || !confirmPassword) {
-      return res.status(400).json({
-        success: false,
-        message: "Both passwords are required",
-      });
-    }
-
-    if (newPassword !== confirmPassword) {
-      return res.status(400).json({
-        success: false,
-        message: "The passwords do not match",
-      });
-    }
-
-    if (newPassword.length < 8) {
-      return res.status(400).json({
-        success: false,
-        message: "Minimum 8 characters required",
-      });
-    }
-
-    console.log('🔐 Backend: Resetting password with token:', token);
-
-    // ✅ Hash the token to match database
-    const hashedToken = crypto
-      .createHash("sha256")
-      .update(token)
-      .digest("hex");
-
+    const hashedToken = crypto.createHash("sha256").update(token).digest("hex");
     const user = await User.findOne({
       resetPasswordToken: hashedToken,
       resetPasswordExpires: { $gt: Date.now() },
     });
 
     if (!user) {
-      console.log('❌ Backend: Invalid or expired token');
-      return res.status(400).json({
-        success: false,
-        message: "Invalid or expired link",
-      });
+      return res.status(400).json({ success: false, message: "Invalid or expired link" });
     }
 
-    // Hash and save new password
     user.password = await bcrypt.hash(newPassword, 10);
     user.resetPasswordToken = undefined;
     user.resetPasswordExpires = undefined;
-
     await user.save();
 
-    console.log('✅ Backend: Password reset successful for:', user.mail);
-                
-    res.json({
-      success: true,
-      message: "Password successfully reset",
-    });
+    res.json({ success: true, message: "Password successfully reset" });
   } catch (err) {
     console.error("❌ Backend error reset-password:", err);
-    res.status(500).json({
-      success: false,
-      message: "Server error",
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+
+router.post("/logout", authenticateToken, async (req, res) => {
+  try {
+    await User.findByIdAndUpdate(req.user.id, {
+      isOnline: false,
+      lastSeen: new Date(),
     });
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false });
+  }
+}); 
+
+router.post("/heartbeat", authenticateToken, async (req, res) => {
+  try {
+    await User.findByIdAndUpdate(req.user.id, {
+      lastSeen: new Date(),
+      isOnline: true,
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false });
   }
 });
 

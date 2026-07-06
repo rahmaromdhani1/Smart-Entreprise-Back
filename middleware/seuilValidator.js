@@ -5,7 +5,7 @@ const VALID_SENSOR_TYPES = [
   "humidity",
   "light",
   "pressure",
-  "co2",
+  "smoke",
   "motion",
 ];
 
@@ -17,7 +17,7 @@ const TYPE_CONFIG = {
   humidity: { unit: "%", hardMin: 0, hardMax: 100 },
   light: { unit: "lux", hardMin: 0, hardMax: 200000 },
   pressure: { unit: "hPa", hardMin: 300, hardMax: 1100 },
-  co2: { unit: "ppm", hardMin: 0, hardMax: 50000 },
+  smoke: { unit: "ppm", hardMin: 0, hardMax: 50000 },
   motion: { unit: "state", hardMin: 0, hardMax: 1 },
 };
 
@@ -84,12 +84,6 @@ export const getAllSeuilProfilesQueryRules = [
       "nodeId must be 2-30 alphanumeric characters (hyphens and underscores allowed)"
     ),
 
-  query("location")
-    .optional()
-    .trim()
-    .isLength({ min: 1, max: 100 })
-    .withMessage("location must be between 1 and 100 characters"),
-
   query("provider")
     .optional()
     .trim()
@@ -125,8 +119,8 @@ export const getAllSeuilProfilesQueryRules = [
 
   query("sortBy")
     .optional()
-    .isIn(["createdAt", "updatedAt", "nodeId", "location"])
-    .withMessage("sortBy must be one of: createdAt, updatedAt, nodeId, location"),
+    .isIn(["createdAt", "updatedAt", "nodeId"])
+    .withMessage("sortBy must be one of: createdAt, updatedAt, nodeId"),
 
   query("order")
     .optional()
@@ -249,11 +243,17 @@ const validateThresholdsObject = (thresholds) => {
 export const updateSeuilProfileRules = [
   ...equipmentIdParamRules,
 
-  body("location")
+  body("floor")
     .optional()
     .trim()
-    .isLength({ min: 2, max: 100 })
-    .withMessage("location must be between 2 and 100 characters"),
+    .isLength({ max: 100 })
+    .withMessage("floor must not exceed 100 characters"),
+
+  body("officeRoom")
+    .optional()
+    .trim()
+    .isLength({ max: 100 })
+    .withMessage("officeRoom must not exceed 100 characters"),
 
   body("thresholds")
     .optional()
@@ -307,13 +307,13 @@ export const updateSeuilProfileRules = [
     }),
 
   body().custom((body) => {
-    const allowedTopLevel = ["location", "thresholds", "meta"];
+    const allowedTopLevel = ["floor", "officeRoom", "thresholds", "meta"];
     const keys = Object.keys(body || {});
     const hasAtLeastOne = keys.some((k) => allowedTopLevel.includes(k));
 
     if (!hasAtLeastOne) {
       throw new Error(
-        "At least one of these fields must be provided: location, thresholds, meta"
+        "At least one of these fields must be provided: floor, officeRoom, thresholds, meta"
       );
     }
 
@@ -321,8 +321,56 @@ export const updateSeuilProfileRules = [
   }),
 ];
 
-
+/**
+ * POST /api/seuils/equipment/:equipmentId/regenerate
+ * No body required, only param validation.
+ */
 export const regenerateSeuilProfileRules = [...equipmentIdParamRules];
 
-
+/**
+ * GET /api/seuils/equipment/:equipmentId
+ */
 export const getSeuilProfileByEquipmentIdRules = [...equipmentIdParamRules];
+/**
+ * PUT /api/seuils/sensor/:sensorType/global
+ */
+export const globalUpdateSensorRules = [
+  param("sensorType")
+    .isIn(VALID_SENSOR_TYPES)
+    .withMessage(`sensorType must be one of: ${VALID_SENSOR_TYPES.join(", ")}`),
+
+  body("min")
+    .notEmpty().withMessage("min is required")
+    .isFloat().withMessage("min must be a number"),
+
+  body("max")
+    .notEmpty().withMessage("max is required")
+    .isFloat().withMessage("max must be a number"),
+
+  body("threshold")
+    .notEmpty().withMessage("threshold is required")
+    .isFloat().withMessage("threshold must be a number"),
+
+  body("hysteresis")
+    .optional()
+    .isFloat({ min: 0 }).withMessage("hysteresis must be >= 0"),
+
+  body("reason")
+    .optional()
+    .trim()
+    .isLength({ max: 300 }).withMessage("reason must not exceed 300 characters"),
+
+  body("description")
+    .optional()
+    .trim()
+    .isLength({ max: 500 }).withMessage("description must not exceed 500 characters"),
+];
+
+/**
+ * POST /api/seuils/sensor/:sensorType/regenerate-all
+ */
+export const globalRegenerateSensorRules = [
+  param("sensorType")
+    .isIn(VALID_SENSOR_TYPES)
+    .withMessage(`sensorType must be one of: ${VALID_SENSOR_TYPES.join(", ")}`),
+];

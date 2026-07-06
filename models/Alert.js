@@ -1,31 +1,37 @@
 import mongoose from "mongoose";
 
 const alertSchema = new mongoose.Schema({
+  // deviceId = mac address — rendu optionnel car BackM utilise meta.mac
   deviceId: {
     type: String,
-    required: true
+    default: null,
   },
   type: {
     type: String,
-    required: true
+    required: true,
   },
   level: {
     type: String,
     enum: ["info", "warning", "critical"],
-    default: "info"
+    default: "info",
   },
   message: {
     type: String,
-    required: true
+    required: true,
+  },
+  // Données brutes de l'anomalie (rempli par BackM)
+  meta: {
+    type: mongoose.Schema.Types.Mixed,
+    default: {},
   },
   seen: {
     type: Boolean,
-    default: false
+    default: false,
   },
   createdAt: {
     type: Date,
-    default: Date.now
-  }
+    default: Date.now,
+  },
 });
 
 export default mongoose.model("Alert", alertSchema);

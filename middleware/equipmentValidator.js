@@ -4,11 +4,11 @@ import { body, param } from 'express-validator';
 // Must mirror VALID_ICONS in Equipment.js and NODE_ICONS/SENSOR_TYPES in AdminControl.jsx
 const VALID_ICONS = [
   'lighting', 'hvac', 'cameras', 'access', 'fire', 'water',
-  'temperature', 'light', 'humidity', 'pressure', 'co2', 'motion',
+  'energy', 'temperature', 'light', 'humidity', 'pressure', 'smoke', 'motion',
 ];
 
 const VALID_SENSOR_TYPES = [
-  'temperature', 'light', 'humidity', 'pressure', 'co2', 'motion',
+  'temperature', 'light', 'humidity', 'pressure', 'smoke', 'motion', 'energy',
 ];
 
 export const createEquipmentRules = [
@@ -23,17 +23,28 @@ export const createEquipmentRules = [
     .toUpperCase()
     .isLength({ max: 50 }).withMessage('Node ID cannot exceed 50 characters'),
 
+  body('mac')
+    .optional()
+    .trim()
+    .matches(/^[0-9A-Fa-f]{12}$/)
+    .withMessage('MAC must be 12 hex characters e.g. BCDE9A34E3EC'),
+
   body('ipAddress')
-    .notEmpty().withMessage('IP Address is required').bail()
+    .optional()
     .matches(
       /^(25[0-5]|2[0-4]\d|[01]?\d\d?)\.(25[0-5]|2[0-4]\d|[01]?\d\d?)\.(25[0-5]|2[0-4]\d|[01]?\d\d?)\.(25[0-5]|2[0-4]\d|[01]?\d\d?)$/
     )
     .withMessage('Invalid IPv4 address'),
 
-  body('location')
+  body('floor')
     .optional()
     .trim()
-    .isLength({ max: 150 }).withMessage('Location cannot exceed 150 characters'),
+    .isLength({ max: 100 }).withMessage('Floor cannot exceed 100 characters'),
+
+  body('officeRoom')
+    .optional()
+    .trim()
+    .isLength({ max: 100 }).withMessage('officeRoom cannot exceed 100 characters'),
 
   body('description')
     .optional()
@@ -54,6 +65,12 @@ export const createEquipmentRules = [
   body('sensors.*')
     .isIn(VALID_SENSOR_TYPES)
     .withMessage(`Each sensor must be one of: ${VALID_SENSOR_TYPES.join(', ')}`),
+
+  // ── actuators — optional array of actuator objects ─────────────────────────
+  body('actuators')
+    .optional()
+    .isArray()
+    .withMessage('actuators must be an array'),
 ];
 
 export const updateEquipmentRules = [
@@ -68,6 +85,12 @@ export const updateEquipmentRules = [
     .toUpperCase()
     .isLength({ max: 50 }).withMessage('Node ID cannot exceed 50 characters'),
 
+  body('mac')
+    .optional()
+    .trim()
+    .matches(/^[0-9A-Fa-f]{12}$/)
+    .withMessage('MAC must be 12 hex characters e.g. BCDE9A34E3EC'),
+
   body('ipAddress')
     .optional()
     .matches(
@@ -79,6 +102,16 @@ export const updateEquipmentRules = [
     .optional()
     .isIn(['online', 'offline'])
     .withMessage('Status must be "online" or "offline"'),
+
+  body('floor')
+    .optional()
+    .trim()
+    .isLength({ max: 100 }).withMessage('Floor cannot exceed 100 characters'),
+
+  body('officeRoom')
+    .optional()
+    .trim()
+    .isLength({ max: 100 }).withMessage('officeRoom cannot exceed 100 characters'),
 
   body('icon')
     .optional()
@@ -93,6 +126,12 @@ export const updateEquipmentRules = [
   body('sensors.*')
     .isIn(VALID_SENSOR_TYPES)
     .withMessage(`Each sensor must be one of: ${VALID_SENSOR_TYPES.join(', ')}`),
+
+  // ── actuators — optional array of actuator objects ─────────────────────────
+  body('actuators')
+    .optional()
+    .isArray()
+    .withMessage('actuators must be an array'),
 ];
 
 export const equipmentIdParam = [

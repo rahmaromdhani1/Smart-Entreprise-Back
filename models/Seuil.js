@@ -5,7 +5,7 @@ const VALID_SENSOR_TYPES = [
   "humidity",
   "light",
   "pressure",
-  "co2",
+  "smoke",
   "motion",
 ];
 
@@ -14,7 +14,7 @@ const TYPE_CONFIG = {
   humidity: { unit: "%", hardMin: 0, hardMax: 100 },
   light: { unit: "lux", hardMin: 0, hardMax: 200000 },
   pressure: { unit: "hPa", hardMin: 300, hardMax: 1100 },
-  co2: { unit: "ppm", hardMin: 0, hardMax: 50000 },
+  smoke: { unit: "ppm", hardMin: 0, hardMax: 50000 },
   motion: { unit: "state", hardMin: 0, hardMax: 1 },
 };
 
@@ -34,7 +34,7 @@ const ThresholdSchema = new mongoose.Schema(
     },
     hysteresis: {
       type: Number,
-      required: [true, "Threshold hysteresis is required"],
+      default: 0,
       min: [0, "Hysteresis must be >= 0"],
     },
     mode: {
@@ -47,15 +47,21 @@ const ThresholdSchema = new mongoose.Schema(
     },
     confidence: {
       type: Number,
-      required: [true, "Confidence is required"],
-      min: [0, "Confidence must be >= 0"],
-      max: [1, "Confidence must be <= 1"],
+      default: 0.5,
+      min: 0,
+      max: 1,
     },
     reason: {
       type: String,
       trim: true,
       default: "",
       maxlength: [300, "Reason must not exceed 300 characters"],
+    },
+    description: {
+      type: String,
+      trim: true,
+      default: "",
+      maxlength: [500, "Description must not exceed 500 characters"],
     },
   },
   { _id: false }
@@ -83,12 +89,18 @@ const SeuilSchema = new mongoose.Schema(
       ],
     },
 
-    location: {
+    floor: {
       type: String,
-      required: [true, "Location is required"],
       trim: true,
-      minlength: [2, "Location must be at least 2 characters"],
-      maxlength: [100, "Location must not exceed 100 characters"],
+      default: "",
+      maxlength: [100, "Floor must not exceed 100 characters"],
+    },
+
+    officeRoom: {
+      type: String,
+      trim: true,
+      default: "",
+      maxlength: [100, "officeRoom must not exceed 100 characters"],
     },
 
     thresholds: {
@@ -98,7 +110,9 @@ const SeuilSchema = new mongoose.Schema(
       default: {},
       validate: {
         validator: function (value) {
-          const keys = Array.from(value.keys());
+          const keys = value instanceof Map
+            ? Array.from(value.keys())
+            : Object.keys(value || {});
           return keys.every((key) => VALID_SENSOR_TYPES.includes(key));
         },
         message: `Threshold keys must be one of: ${VALID_SENSOR_TYPES.join(", ")}`,
@@ -136,52 +150,61 @@ const SeuilSchema = new mongoose.Schema(
   }
 );
 
-SeuilSchema.pre("validate", function (next) {
+// ── pre("validate") ────────────────────────────────────────────────────────────
+// Using async (no next parameter) is the correct pattern when the hook can
+// throw — Mongoose/Kareem handles the rejection automatically.
+// Using function(next) + throw causes "next is not a function" because Kareem
+// catches the throw at line 63 and tries to call next(err), but by that point
+// next is out of scope / undefined in certain Mongoose versions.
+SeuilSchema.pre("validate", async function () {
+  // Normalize: if thresholds was assigned as a plain object (e.g. from req.body),
+  // convert it to a Map so .entries() works reliably below.
+  if (this.thresholds && !(this.thresholds instanceof Map)) {
+    this.thresholds = new Map(Object.entries(this.thresholds));
+  }
+
   for (const [sensorType, threshold] of this.thresholds.entries()) {
     const config = TYPE_CONFIG[sensorType];
 
     if (!config) {
-      return next(new Error(`Unknown sensor type: ${sensorType}`));
+      throw new Error(`Unknown sensor type: ${sensorType}`);
     }
 
-    if (threshold.min > threshold.max) {
-      return next(
-        new Error(`${sensorType}: min cannot be greater than max`)
+    const min   = threshold.min;
+    const max   = threshold.max;
+    const value = threshold.threshold;
+
+    if (min == null || max == null || value == null) {
+      throw new Error(`${sensorType}: missing required values`);
+    }
+
+    if (min > max) {
+      throw new Error(`${sensorType}: min cannot be greater than max`);
+    }
+
+    if (value < min || value > max) {
+      throw new Error(`${sensorType}: threshold must be between min and max`);
+    }
+
+    if (min < config.hardMin || min > config.hardMax) {
+      throw new Error(
+        `${sensorType}: min must be between ${config.hardMin} and ${config.hardMax} ${config.unit}`
       );
     }
 
-    if (threshold.threshold < threshold.min || threshold.threshold > threshold.max) {
-      return next(
-        new Error(`${sensorType}: threshold must be between min and max`)
+    if (max < config.hardMin || max > config.hardMax) {
+      throw new Error(
+        `${sensorType}: max must be between ${config.hardMin} and ${config.hardMax} ${config.unit}`
       );
     }
 
-    if (threshold.min < config.hardMin || threshold.min > config.hardMax) {
-      return next(
-        new Error(
-          `${sensorType}: min must be between ${config.hardMin} and ${config.hardMax} ${config.unit}`
-        )
-      );
-    }
-
-    if (threshold.max < config.hardMin || threshold.max > config.hardMax) {
-      return next(
-        new Error(
-          `${sensorType}: max must be between ${config.hardMin} and ${config.hardMax} ${config.unit}`
-        )
-      );
-    }
-
-    if (threshold.threshold < config.hardMin || threshold.threshold > config.hardMax) {
-      return next(
-        new Error(
-          `${sensorType}: threshold must be between ${config.hardMin} and ${config.hardMax} ${config.unit}`
-        )
+    if (value < config.hardMin || value > config.hardMax) {
+      throw new Error(
+        `${sensorType}: threshold must be between ${config.hardMin} and ${config.hardMax} ${config.unit}`
       );
     }
   }
-
-  next();
+  // No next() call needed — async hooks resolve/reject automatically
 });
 
 const Seuil = mongoose.model("Seuil", SeuilSchema);

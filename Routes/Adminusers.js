@@ -1,4 +1,3 @@
-//Routes/Adminusers
 import express from "express";
 import bcrypt from "bcryptjs";
 import User from "../models/User.js";
@@ -6,194 +5,233 @@ import { authenticateToken } from "../middleware/auth.js";
 
 const router = express.Router();
 
-/**
- * GET /api/ users
- * Fetch all users
- */
-router.get("/", authenticateToken, async (req, res) => {
-  console.log("🔵 GET /api/users - Fetching all users");
-  
+const HEARTBEAT_TIMEOUT_MS = 65 * 1000;
+
+const getPresenceStatus = (isOnline, lastSeen) => {
+  if (!isOnline || !lastSeen) return 'offline';
+  const elapsed = Date.now() - new Date(lastSeen).getTime();
+  return elapsed < HEARTBEAT_TIMEOUT_MS ? 'online' : 'offline';
+};
+
+const formatLastSeen = (isOnline, lastSeen) => {
+  if (!lastSeen) return 'Never';
+  const elapsed = Date.now() - new Date(lastSeen).getTime();
+  if (isOnline && elapsed < HEARTBEAT_TIMEOUT_MS) return 'Active now';
+  const seconds = Math.floor(elapsed / 1000);
+  if (seconds < 60)    return `${seconds}s ago`;
+  if (seconds < 3600)  return `${Math.floor(seconds / 60)}m ago`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+  return new Date(lastSeen).toLocaleDateString();
+};
+
+const transformUser = (user) => {
+  const initials = `${user.firstName.charAt(0)}${user.lastName.charAt(0)}`.toUpperCase();
+  return {
+    id:               user._id,
+    name:             `${user.firstName} ${user.lastName}`,
+    initials,
+    email:            user.mail,
+    role:             user.role.toLowerCase(),
+    functionalGrade:  user.functionalGrade,
+    floor:            user.floor,
+    officeRoom:       user.officeRoom,
+    additionalAccess: user.additionalAccess ?? [],
+    status:           getPresenceStatus(user.isOnline, user.lastSeen),
+    lastLogin:        formatLastSeen(user.isOnline, user.lastSeen),
+    avatarColor:      user.avatarColor,
+    avatarImage:      user.avatarImage,
+  };
+};
+
+// ─── Heartbeat ────────────────────────────────────────────────────────────────
+router.post("/heartbeat", authenticateToken, async (req, res) => {
   try {
-    const users = await User.find().select("-password"); // Exclude password field
-    
-    // Transform users to match frontend expectations
-    const transformedUsers = users.map(user => {
-      const initials = `${user.firstName.charAt(0)}${user.lastName.charAt(0)}`.toUpperCase();
-      
-      return {
-        id: user._id,
-        name: `${user.firstName} ${user.lastName}`,
-        initials: initials,
-        email: user.mail,
-        role: user.role.toLowerCase(), // Convert "Admin"/"Staff" to "admin"/"staff"
-        functionalGrade: user.functionalGrade,
-        status: "active", // Hardcoded for now
-        lastLogin: "Today, 09:00", // Hardcoded for now - you can add this field to User model later
-        avatarColor: user.avatarColor,
-        avatarImage: user.avatarImage
-      };
+    const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    const wasOnline = user.isOnline;
+
+    await User.findByIdAndUpdate(req.user.id, {
+      lastSeen: new Date(),
+      isOnline: true,
     });
-    
-    console.log(`✅ Successfully fetched ${transformedUsers.length} users`);
-    res.json(transformedUsers);
-    
+
+    // Émet seulement si le statut change (offline → online)
+    if (!wasOnline) {
+      req.app.get('io').emit('user:statusChange', {
+        userId: String(req.user.id),
+        status: 'online',
+        lastLogin: 'Active now',
+      });
+    }
+
+    res.json({ ok: true });
   } catch (err) {
-    console.error("❌ Error fetching users:", err.message);
+    res.status(500).json({ message: "Heartbeat failed" });
+  }
+});
+
+// ─── Mark offline ─────────────────────────────────────────────────────────────
+router.post("/offline", authenticateToken, async (req, res) => {
+  try {
+    const user = await User.findByIdAndUpdate(
+      req.user.id,
+      { isOnline: false, lastSeen: new Date() },
+      { new: true }
+    );
+
+    if (user) {
+      req.app.get('io').emit('user:statusChange', {
+        userId: String(req.user.id),
+        status: 'offline',
+        lastLogin: formatLastSeen(false, user.lastSeen),
+      });
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ message: "Could not mark offline" });
+  }
+});
+
+// ─── Grades / Floors / Rooms ──────────────────────────────────────────────────
+router.get("/grades", authenticateToken, async (req, res) => {
+  try {
+    const grades = await User.distinct("functionalGrade", { functionalGrade: { $ne: null } });
+    res.json(grades);
+  } catch (err) {
+    res.status(500).json({ message: "Failed to fetch grades", error: err.message });
+  }
+});
+
+router.get("/floors", authenticateToken, async (req, res) => {
+  try {
+    const primary    = await User.distinct("floor", { floor: { $nin: [null, ""] } });
+    const additional = await User.distinct("additionalAccess.floor", { "additionalAccess.floor": { $nin: [null, ""] } });
+    res.json([...new Set([...primary, ...additional])].sort());
+  } catch (err) {
+    res.status(500).json({ message: "Failed to fetch floors", error: err.message });
+  }
+});
+
+router.get("/rooms", authenticateToken, async (req, res) => {
+  try {
+    const primary    = await User.distinct("officeRoom", { officeRoom: { $nin: [null, ""] } });
+    const additional = await User.distinct("additionalAccess.officeRoom", { "additionalAccess.officeRoom": { $nin: [null, ""] } });
+    res.json([...new Set([...primary, ...additional])].sort());
+  } catch (err) {
+    res.status(500).json({ message: "Failed to fetch rooms", error: err.message });
+  }
+});
+
+// ─── GET /api/users ───────────────────────────────────────────────────────────
+router.get("/", authenticateToken, async (req, res) => {
+  try {
+    const users = await User.find().select("-password");
+    res.json(users.map(transformUser));
+  } catch (err) {
     res.status(500).json({ message: "Failed to fetch users", error: err.message });
   }
 });
 
-/**
- * POST /api/users
- * Create a new user
- */
+// ─── POST /api/users ──────────────────────────────────────────────────────────
 router.post("/", authenticateToken, async (req, res) => {
-  console.log("🔵 POST /api/users - Creating new user");
-  console.log("📦 Request body:", req.body);
-  
-  const { firstName, lastName, email, phone, password, role, functionalGrade } = req.body;
+  const {
+    firstName, lastName, email, phone, password, role,
+    functionalGrade, floor, officeRoom, additionalAccess,
+  } = req.body;
 
   try {
-    // Validation
     if (!firstName || !lastName || !email || !phone || !password || !role) {
-      return res.status(400).json({ 
-        message: "All fields are required (firstName, lastName, email, phone, password, role)" 
-      });
+      return res.status(400).json({ message: "All fields are required" });
     }
-    
-    // Check if user already exists
-    const existingUser = await User.findOne({ 
-      $or: [{ mail: email }, { phone: phone }] 
-    });
-    
+
+    const existingUser = await User.findOne({ $or: [{ mail: email }, { phone }] });
     if (existingUser) {
-      return res.status(400).json({ 
-        message: "User with this email or phone already exists" 
-      });
+      return res.status(400).json({ message: "User with this email or phone already exists" });
     }
-    
-    // Hash password
+
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
-    
-    // Create new user
+
+    const cleanAccess = Array.isArray(additionalAccess)
+      ? additionalAccess.filter(a => a.floor && a.officeRoom).map(a => ({
+          floor:      a.floor.trim(),
+          officeRoom: a.officeRoom.trim(),
+          canControl: Boolean(a.canControl),
+        }))
+      : [];
+
     const newUser = new User({
-      firstName,
-      lastName,
-      mail: email,
+      firstName, lastName,
+      mail:  email,
       phone,
       password: hashedPassword,
-      role: role.charAt(0).toUpperCase() + role.slice(1).toLowerCase(), // Capitalize first letter
+      role: role.charAt(0).toUpperCase() + role.slice(1).toLowerCase(),
       functionalGrade: functionalGrade || null,
-      avatarColor: "#8B5CF6" // Default color
+      floor:           floor      || null,
+      officeRoom:      officeRoom || null,
+      additionalAccess: cleanAccess,
+      avatarColor: "#8B5CF6",
     });
-    
+
     await newUser.save();
-    
-    // Return transformed user (excluding password)
-    const initials = `${newUser.firstName.charAt(0)}${newUser.lastName.charAt(0)}`.toUpperCase();
-    const transformedUser = {
-      id: newUser._id,
-      name: `${newUser.firstName} ${newUser.lastName}`,
-      initials: initials,
-      email: newUser.mail,
-      role: newUser.role.toLowerCase(),
-      functionalGrade: newUser.functionalGrade,
-      status: "active",
-      lastLogin: "Just now",
-      avatarColor: newUser.avatarColor,
-      avatarImage: newUser.avatarImage
-    };
-    
-    console.log("✅ User created successfully:", transformedUser.email);
-    res.status(201).json(transformedUser);
-    
+    res.status(201).json(transformUser(newUser));
   } catch (err) {
-    console.error("❌ Error creating user:", err.message);
     res.status(500).json({ message: "Failed to create user", error: err.message });
   }
 });
 
-/**
- * PUT /api/users/:id
- * Update an existing user
- */
+// ─── PUT /api/users/:id ───────────────────────────────────────────────────────
 router.put("/:id", authenticateToken, async (req, res) => {
-  console.log(`🔵 PUT /api/users/${req.params.id} - Updating user`);
-  console.log("📦 Request body:", req.body);
-  
   const { id } = req.params;
-  const { firstName, lastName, email, phone, password, role, functionalGrade } = req.body;
-  
-  try {
-    // Find user
-    const user = await User.findById(id);
-    
-    if (!user) {
-      return res.status(404).json({ message: "User not found" });
-    }
-    
-    // Update fields if provided
-    if (firstName) user.firstName = firstName;
-    if (lastName) user.lastName = lastName;
-    if (email) user.mail = email;
-    if (phone) user.phone = phone;
-    if (role) user.role = role.charAt(0).toUpperCase() + role.slice(1).toLowerCase();
-    if (functionalGrade !== undefined) user.functionalGrade = functionalGrade;
+  const {
+    firstName, lastName, email, phone, password, role,
+    functionalGrade, floor, officeRoom, additionalAccess,
+  } = req.body;
 
-    // Update password if provided
+  try {
+    const user = await User.findById(id);
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    if (firstName)  user.firstName = firstName;
+    if (lastName)   user.lastName  = lastName;
+    if (email)      user.mail      = email;
+    if (phone)      user.phone     = phone;
+    if (role)       user.role      = role.charAt(0).toUpperCase() + role.slice(1).toLowerCase();
+    if (functionalGrade !== undefined) user.functionalGrade = functionalGrade;
+    if (floor       !== undefined)     user.floor           = floor      || null;
+    if (officeRoom  !== undefined)     user.officeRoom      = officeRoom || null;
+
+    if (additionalAccess !== undefined) {
+      user.additionalAccess = Array.isArray(additionalAccess)
+        ? additionalAccess.filter(a => a.floor && a.officeRoom).map(a => ({
+            floor:      a.floor.trim(),
+            officeRoom: a.officeRoom.trim(),
+            canControl: Boolean(a.canControl),
+          }))
+        : [];
+    }
+
     if (password) {
       const salt = await bcrypt.genSalt(10);
       user.password = await bcrypt.hash(password, salt);
     }
-    
+
     await user.save();
-    
-    // Return transformed user
-    const initials = `${user.firstName.charAt(0)}${user.lastName.charAt(0)}`.toUpperCase();
-    const transformedUser = {
-      id: user._id,
-      name: `${user.firstName} ${user.lastName}`,
-      initials: initials,
-      email: user.mail,
-      role: user.role.toLowerCase(),
-      functionalGrade: user.functionalGrade,
-      status: "active",
-      lastLogin: "Just now",
-      avatarColor: user.avatarColor,
-      avatarImage: user.avatarImage
-    };
-    
-    console.log("✅ User updated successfully:", transformedUser.email);
-    res.json(transformedUser);
-    
+    res.json(transformUser(user));
   } catch (err) {
-    console.error("❌ Error updating user:", err.message);
     res.status(500).json({ message: "Failed to update user", error: err.message });
   }
 });
 
-/**
- * DELETE /api/ users/:id
- * Delete a user
- */
+// ─── DELETE /api/users/:id ────────────────────────────────────────────────────
 router.delete("/:id", authenticateToken, async (req, res) => {
-  console.log(`🔵 DELETE /api/users/${req.params.id} - Deleting user`);
-  
-  const { id } = req.params;
-  
   try {
-    const user = await User.findByIdAndDelete(id);
-    
-    if (!user) {
-      return res.status(404).json({ message: "User not found" });
-    }
-    
-    console.log("✅ User deleted successfully:", user.mail);
+    const user = await User.findByIdAndDelete(req.params.id);
+    if (!user) return res.status(404).json({ message: "User not found" });
     res.json({ message: "User deleted successfully", id: user._id });
-    
   } catch (err) {
-    console.error("❌ Error deleting user:", err.message);
     res.status(500).json({ message: "Failed to delete user", error: err.message });
   }
 });

@@ -40,5 +40,5 @@ router.post("/upload-avatar/:userId", upload.single("avatar"), async (req, res) 
 });
 
 router.get("/profile/:userId", authenticateToken, getUserProfile);
-
+router.get("/profile", authenticateToken, getUserProfile);
 export default router;
